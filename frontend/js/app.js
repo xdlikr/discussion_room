@@ -26,9 +26,10 @@ function initElements() {
         addAgentBtn: document.getElementById('addAgentBtn'),
         newDiscussionBtn: document.getElementById('newDiscussionBtn'),
         summarizeBtn: document.getElementById('summarizeBtn'),
-        stopBtn: document.getElementById('stopBtn'),
-        resumeBtn: document.getElementById('resumeBtn'),
-        currentTopic: document.getElementById('currentTopic'),
+    stopBtn: document.getElementById('stopBtn'),
+    resumeBtn: document.getElementById('resumeBtn'),
+    enhanceBtn: document.getElementById('enhanceBtn'),
+    currentTopic: document.getElementById('currentTopic'),
         agentModal: document.getElementById('agentModal'),
         agentForm: document.getElementById('agentForm'),
         closeModalBtn: document.getElementById('closeModalBtn'),
@@ -132,6 +133,10 @@ function setupEventListeners() {
     
     if (elements.resumeBtn) {
         elements.resumeBtn.addEventListener('click', resumeDiscussion);
+    }
+    
+    if (elements.enhanceBtn) {
+        elements.enhanceBtn.addEventListener('click', triggerDataEnhancement);
     }
     
     if (elements.closeModalBtn) {
@@ -722,9 +727,15 @@ async function streamDiscussion(action, content = null) {
                             scrollToBottom();
                         } else if (data.type === 'round_end') {
                             // 轮次结束，可以添加分隔线
-                        } else if (data.type === 'debate_done') {
-                            // 辩论结束，自动提取股票代码并增强
-                            await autoEnhanceWithData();
+                    } else if (data.type === 'debate_done') {
+                        // 辩论结束，显示数据增强按钮提示
+                        const doneDiv = document.createElement('div');
+                        doneDiv.className = 'debate-separator';
+                        doneDiv.innerHTML = '<div class="debate-label">💬 辩论讨论完成。点击"数据增强"按钮获取实时股票数据验证分析。</div>';
+                        elements.messagesContainer.appendChild(doneDiv);
+                        scrollToBottom();
+                        // 显示数据增强按钮
+                        elements.enhanceBtn.style.display = 'block';
                         } else if (data.type === 'enhance_done') {
                             // 数据增强完成
                             const doneDiv = document.createElement('div');
@@ -1093,7 +1104,40 @@ async function resumeDiscussion() {
     }
 }
 
-// ===== 自动数据增强 =====
+// ===== 数据增强 =====
+
+async function triggerDataEnhancement() {
+    if (!currentDiscussionId) return;
+    
+    try {
+        // 获取所有消息
+        const response = await fetch(`${API_BASE}/discussions/${currentDiscussionId}`);
+        const data = await response.json();
+        
+        // 提取所有Agent消息中的股票代码
+        const allText = data.messages
+            .filter(msg => msg.message_type === 'agent')
+            .map(msg => msg.content)
+            .join(' ');
+        
+        const symbols = extractStockSymbols(allText);
+        
+        if (symbols.length > 0) {
+            elements.enhanceBtn.disabled = true;
+            elements.enhanceBtn.textContent = '📊 加载中...';
+            await enhanceWithStockData(symbols);
+            elements.enhanceBtn.disabled = false;
+            elements.enhanceBtn.textContent = '📊 数据增强';
+        } else {
+            showError('未检测到股票代码，请确保讨论中包含股票名称或代码');
+        }
+    } catch (error) {
+        console.error('数据增强失败:', error);
+        showError('数据增强失败');
+        elements.enhanceBtn.disabled = false;
+        elements.enhanceBtn.textContent = '📊 数据增强';
+    }
+}
 
 async function autoEnhanceWithData() {
     if (!currentDiscussionId) return;
@@ -1122,12 +1166,30 @@ async function autoEnhanceWithData() {
 }
 
 function extractStockSymbols(text) {
-    // 常见股票代码映射
+    // 扩展股票代码映射
     const stockMap = {
         "特斯拉": "TSLA", "苹果": "AAPL", "微软": "MSFT", "英伟达": "NVDA",
         "谷歌": "GOOGL", "亚马逊": "AMZN", "Meta": "META", "脸书": "META",
-        "Netflix": "NFLX", "奈飞": "NFLX", "阿里巴巴": "BABA"
+        "Netflix": "NFLX", "奈飞": "NFLX", "阿里巴巴": "BABA", "腾讯": "TCEHY",
+        "比亚迪": "BYDDF", "蔚来": "NIO", "理想": "LI", "小鹏": "XPEV",
+        "特斯拉": "TSLA", "苹果公司": "AAPL", "微软公司": "MSFT"
     };
+    
+    // 常见误识别词黑名单（扩展）
+    const blacklist = new Set([
+        "THE", "AND", "FOR", "ARE", "BUT", "NOT", "YOU", "ALL", "CAN", "HER", "WAS", 
+        "ONE", "OUR", "OUT", "DAY", "GET", "HAS", "HIM", "HIS", "HOW", "ITS", "MAY", 
+        "NEW", "NOW", "OLD", "SEE", "TWO", "WAY", "WHO", "BOY", "DID", "LET", "PUT", 
+        "SAY", "SHE", "TOO", "USE", "AI", "IT", "API", "CEO", "CFO", "CTO", "USA", 
+        "UK", "EU", "USD", "CNY", "GDP", "CPI", "PMI", "ETF", "IPO", "SEC", "FDA"
+    ]);
+    
+    // 常见股票代码白名单（美股主要股票）
+    const whitelist = new Set([
+        "AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "NVDA", "NFLX", "BABA",
+        "JPM", "V", "JNJ", "WMT", "PG", "MA", "UNH", "HD", "DIS", "PYPL", "BAC",
+        "XOM", "VZ", "ADBE", "CMCSA", "NKE", "CSCO", "PFE", "MRK", "ABT", "TMO"
+    ]);
     
     const symbols = [];
     const upperText = text.toUpperCase();
@@ -1135,12 +1197,20 @@ function extractStockSymbols(text) {
     // 提取美股代码（2-5个大写字母）
     const codePattern = /\b([A-Z]{2,5})\b/g;
     const matches = upperText.matchAll(codePattern);
-    const commonWords = new Set(["THE", "AND", "FOR", "ARE", "BUT", "NOT", "YOU", "ALL", "CAN", "HER", "WAS", "ONE", "OUR", "OUT", "DAY", "GET", "HAS", "HIM", "HIS", "HOW", "ITS", "MAY", "NEW", "NOW", "OLD", "SEE", "TWO", "WAY", "WHO", "BOY", "DID", "LET", "PUT", "SAY", "SHE", "TOO", "USE"]);
     
     for (const match of matches) {
         const code = match[1];
-        if (!commonWords.has(code) && code.length >= 2) {
+        // 优先检查白名单，如果在白名单中直接添加
+        if (whitelist.has(code)) {
             symbols.push(code);
+        }
+        // 否则检查是否在黑名单中，如果不在且长度>=2，可能是股票代码
+        else if (!blacklist.has(code) && code.length >= 2 && code.length <= 5) {
+            // 进一步验证：如果代码出现在常见股票上下文中（如"$AAPL"或"AAPL stock"）
+            const context = text.substring(Math.max(0, match.index - 10), Math.min(text.length, match.index + code.length + 10));
+            if (context.includes('$') || context.toLowerCase().includes('stock') || context.toLowerCase().includes('股价')) {
+                symbols.push(code);
+            }
         }
     }
     

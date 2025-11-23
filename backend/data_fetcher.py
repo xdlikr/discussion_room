@@ -4,6 +4,7 @@
 """
 import httpx
 import os
+import time
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
 
@@ -11,23 +12,31 @@ load_dotenv()
 
 
 class StockDataFetcher:
-    """股票数据获取器"""
+    """股票数据获取器（带缓存）"""
     
-    def __init__(self):
+    def __init__(self, cache_ttl: int = 300):
+        """
+        Args:
+            cache_ttl: 缓存有效期（秒），默认5分钟
+        """
         self.yahoo_finance_base = "https://query1.finance.yahoo.com/v8/finance/chart"
         self.alpha_vantage_key = os.getenv("ALPHA_VANTAGE_API_KEY")
+        self.cache_ttl = cache_ttl
+        self._cache: Dict[str, tuple] = {}  # {symbol: (data, timestamp)}
     
     async def get_stock_trends(
         self, 
         symbols: List[str],
-        periods: List[str] = ["1w", "1mo", "3mo"]
+        periods: List[str] = ["1w", "1mo", "3mo"],
+        use_cache: bool = True
     ) -> Dict[str, Dict]:
         """
-        获取股票趋势数据
+        获取股票趋势数据（带缓存）
         
         Args:
             symbols: 股票代码列表，如 ["TSLA", "AAPL"]
             periods: 时间周期列表，如 ["1w", "1mo", "3mo"]
+            use_cache: 是否使用缓存
         
         Returns:
             {
@@ -43,14 +52,31 @@ class StockDataFetcher:
             }
         """
         results = {}
+        current_time = time.time()
         
         for symbol in symbols:
+            # 检查缓存
+            if use_cache and symbol in self._cache:
+                cached_data, cache_time = self._cache[symbol]
+                if current_time - cache_time < self.cache_ttl:
+                    results[symbol] = cached_data
+                    continue
+            
+            # 缓存未命中或过期，重新获取
             try:
                 data = await self._fetch_yahoo_data(symbol, periods)
                 if data:
                     results[symbol] = data
+                    # 更新缓存
+                    if use_cache:
+                        self._cache[symbol] = (data, current_time)
             except Exception as e:
                 print(f"获取 {symbol} 数据失败: {e}")
+                # 如果缓存中有旧数据，使用旧数据
+                if use_cache and symbol in self._cache:
+                    cached_data, _ = self._cache[symbol]
+                    results[symbol] = cached_data
+                    print(f"使用 {symbol} 的缓存数据")
                 continue
         
         return results

@@ -2,9 +2,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from typing import List
+from typing import List, Dict, Tuple, AsyncGenerator
 from pydantic import BaseModel
 import json
+import asyncio
 from database import get_db, Discussion, Message, Agent
 from models import (
     DiscussionCreate, DiscussionResponse, DiscussionDetail,
@@ -27,6 +28,77 @@ class DebateRequest(BaseModel):
 
 class EnhanceWithDataRequest(BaseModel):
     symbols: List[str]  # 股票代码列表
+
+
+# ===== 并行处理辅助函数 =====
+
+async def process_agent_response(
+    agent: Agent,
+    messages: List[Dict[str, str]],
+    discussion_id: int,
+    db: AsyncSession
+) -> Tuple[int, str, bool]:
+    """
+    并行处理单个Agent的回复，带模型降级策略
+    
+    Returns:
+        (agent_id, content, success): Agent ID、回复内容、是否成功
+    """
+    # 模型降级策略：主模型 -> 备用模型 -> 默认模型
+    fallback_models = [
+        agent.model,  # 主模型
+        "deepseek-ai/DeepSeek-V3.2-Exp",  # 备用模型1
+        "Qwen/Qwen2.5-7B-Instruct"  # 默认模型
+    ]
+    
+    # 去重，避免重复尝试相同模型
+    fallback_models = list(dict.fromkeys(fallback_models))
+    
+    last_error = None
+    for model_to_try in fallback_models:
+        try:
+            full_content = ""
+            async for chunk in ai_client.chat_completion_stream(messages, model=model_to_try):
+                full_content += chunk
+            
+            if not full_content.strip():
+                if model_to_try != fallback_models[-1]:  # 不是最后一个模型，继续尝试
+                    continue
+                return (agent.id, "错误: 模型没有返回内容", False)
+            
+            # 成功，保存到数据库
+            message = Message(
+                discussion_id=discussion_id,
+                agent_id=agent.id,
+                content=full_content,
+                message_type="agent"
+            )
+            db.add(message)
+            await db.commit()
+            
+            return (agent.id, full_content, True)
+        except Exception as e:
+            last_error = e
+            # 如果不是最后一个模型，继续尝试下一个
+            if model_to_try != fallback_models[-1]:
+                continue
+            # 所有模型都失败
+            break
+    
+    # 所有模型都失败，保存错误消息
+    error_msg = f"错误: {str(last_error)} (已尝试{len(fallback_models)}个模型)"
+    try:
+        message = Message(
+            discussion_id=discussion_id,
+            agent_id=agent.id,
+            content=error_msg,
+            message_type="agent"
+        )
+        db.add(message)
+        await db.commit()
+    except:
+        pass
+    return (agent.id, error_msg, False)
 
 
 @router.get("", response_model=List[DiscussionResponse])
@@ -95,7 +167,7 @@ async def create_discussion(
 
 @router.post("/{discussion_id}/start")
 async def start_discussion(discussion_id: int, db: AsyncSession = Depends(get_db)):
-    """开始讨论 - 让所有Agent依次发言"""
+    """开始讨论 - 并行处理所有Agent回复"""
     # 获取讨论
     result = await db.execute(
         select(Discussion).where(Discussion.id == discussion_id)
@@ -112,29 +184,28 @@ async def start_discussion(discussion_id: int, db: AsyncSession = Depends(get_db
         raise HTTPException(status_code=400, detail="No agents available")
     
     async def generate():
-        """流式生成所有Agent的回复"""
+        """并行处理所有Agent的回复，但按顺序输出"""
+        # 准备所有Agent的消息上下文
+        # 获取之前的对话记录（所有Agent共享）
+        result = await db.execute(
+            select(Message, Agent.name)
+            .outerjoin(Agent, Message.agent_id == Agent.id)
+            .where(Message.discussion_id == discussion_id)
+            .order_by(Message.created_at)
+        )
+        previous_messages = result.all()
+        
+        # 滑动窗口：只保留最近15条
+        if len(previous_messages) > 15:
+            previous_messages = previous_messages[-15:]
+        
+        # 为每个Agent构建消息上下文
+        agent_messages_map = {}
         for agent in agents:
-            # 发送Agent开始标记
-            yield f"data: {json.dumps({'type': 'agent_start', 'agent_id': agent.id, 'agent_name': agent.name, 'agent_role': agent.role})}\n\n"
-            
-            # 构建对话历史
             messages = [
                 {"role": "system", "content": agent.system_prompt},
                 {"role": "user", "content": f"讨论主题：{discussion.topic}"}
             ]
-            
-            # 获取之前的对话记录（其他Agent的观点）
-            result = await db.execute(
-                select(Message, Agent.name)
-                .outerjoin(Agent, Message.agent_id == Agent.id)
-                .where(Message.discussion_id == discussion_id)
-                .order_by(Message.created_at)
-            )
-            previous_messages = result.all()
-            
-            # 滑动窗口：只保留最近15条
-            if len(previous_messages) > 15:
-                previous_messages = previous_messages[-15:]
             
             if previous_messages:
                 context = "\n\n以下是其他分析师的观点：\n"
@@ -143,56 +214,62 @@ async def start_discussion(discussion_id: int, db: AsyncSession = Depends(get_db
                         context += f"\n【{agent_name}】：{msg.content}\n"
                 messages.append({"role": "user", "content": context})
             
-            # 流式获取AI回复（使用Agent指定的模型）
-            full_content = ""
-            try:
-                async for chunk in ai_client.chat_completion_stream(messages, model=agent.model):
-                    full_content += chunk
-                    yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
-            except Exception as e:
-                error_msg = f"错误: {str(e)}"
-                full_content = error_msg
-                yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            agent_messages_map[agent.id] = messages
+        
+        # 并行执行所有Agent的回复
+        tasks = [
+            process_agent_response(agent, agent_messages_map[agent.id], discussion_id, db)
+            for agent in agents
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # 按Agent顺序输出结果
+        for i, agent in enumerate(agents):
+            yield f"data: {json.dumps({'type': 'agent_start', 'agent_id': agent.id, 'agent_name': agent.name, 'agent_role': agent.role})}\n\n"
             
-            # 保存消息到数据库（即使出错也保存）
-            if full_content.strip():
-                message = Message(
-                    discussion_id=discussion_id,
-                    agent_id=agent.id,
-                    content=full_content,
-                    message_type="agent"
-                )
-                db.add(message)
-                await db.commit()
+            if isinstance(results[i], Exception):
+                error_msg = f"错误: {str(results[i])}"
+                yield f"data: {json.dumps({'type': 'error', 'message': str(results[i])})}\n\n"
+                yield f"data: {json.dumps({'type': 'content', 'content': error_msg})}\n\n"
+            else:
+                agent_id, content, success = results[i]
+                # 流式输出内容（分块以保持流式体验）
+                if success:
+                    chunk_size = 50
+                    for j in range(0, len(content), chunk_size):
+                        chunk = content[j:j+chunk_size]
+                        yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'type': 'error', 'message': content})}\n\n"
+                    yield f"data: {json.dumps({'type': 'content', 'content': content})}\n\n"
             
-            # 发送Agent结束标记
             yield f"data: {json.dumps({'type': 'agent_end', 'agent_id': agent.id})}\n\n"
         
         # 所有Agent发言完毕
         yield f"data: {json.dumps({'type': 'all_done'})}\n\n"
         
-        # 自动触发辩论（2轮）
+        # 自动触发辩论（2轮）- 也使用并行处理
         yield f"data: {json.dumps({'type': 'debate_starting'})}\n\n"
         
         for round_num in range(1, 3):  # 2轮辩论
             yield f"data: {json.dumps({'type': 'round_start', 'round': round_num})}\n\n"
             
+            # 获取最新历史消息
+            result = await db.execute(
+                select(Message, Agent.name)
+                .outerjoin(Agent, Message.agent_id == Agent.id)
+                .where(Message.discussion_id == discussion_id)
+                .order_by(Message.created_at)
+            )
+            history_messages = result.all()
+            
+            if len(history_messages) > 15:
+                history_messages = history_messages[-15:]
+            
+            # 为每个Agent构建辩论消息
+            debate_tasks = []
             for agent in agents:
-                yield f"data: {json.dumps({'type': 'agent_start', 'agent_id': agent.id, 'agent_name': agent.name, 'agent_role': agent.role, 'round': round_num})}\n\n"
-                
                 messages = [{"role": "system", "content": agent.system_prompt}]
-                
-                result = await db.execute(
-                    select(Message, Agent.name)
-                    .outerjoin(Agent, Message.agent_id == Agent.id)
-                    .where(Message.discussion_id == discussion_id)
-                    .order_by(Message.created_at)
-                )
-                history_messages = result.all()
-                
-                if len(history_messages) > 15:
-                    history_messages = history_messages[-15:]
-                
                 messages.append({"role": "user", "content": f"讨论主题：{discussion.topic}"})
                 
                 for msg, agent_name in history_messages:
@@ -208,28 +285,29 @@ async def start_discussion(discussion_id: int, db: AsyncSession = Depends(get_db
                     debate_prompt = "\n\n请基于其他分析师的观点，进行回应：你可以同意并补充，可以反驳并提出理由，也可以提出新问题。"
                 else:
                     debate_prompt = f"\n\n这是第{round_num}轮辩论，请基于之前的讨论继续深入：回应反驳、补充观点或提出新问题。"
-                
                 messages.append({"role": "user", "content": debate_prompt})
                 
-                full_content = ""
-                try:
-                    async for chunk in ai_client.chat_completion_stream(messages, model=agent.model):
-                        full_content += chunk
-                        yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
-                except Exception as e:
-                    error_msg = f"错误: {str(e)}"
-                    full_content = error_msg
-                    yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+                debate_tasks.append(process_agent_response(agent, messages, discussion_id, db))
+            
+            # 并行执行辩论轮次
+            debate_results = await asyncio.gather(*debate_tasks, return_exceptions=True)
+            
+            # 按顺序输出辩论结果
+            for i, agent in enumerate(agents):
+                yield f"data: {json.dumps({'type': 'agent_start', 'agent_id': agent.id, 'agent_name': agent.name, 'agent_role': agent.role, 'round': round_num})}\n\n"
                 
-                if full_content.strip():
-                    message = Message(
-                        discussion_id=discussion_id,
-                        agent_id=agent.id,
-                        content=full_content,
-                        message_type="agent"
-                    )
-                    db.add(message)
-                    await db.commit()
+                if isinstance(debate_results[i], Exception):
+                    error_msg = f"错误: {str(debate_results[i])}"
+                    yield f"data: {json.dumps({'type': 'error', 'message': str(debate_results[i])})}\n\n"
+                    yield f"data: {json.dumps({'type': 'content', 'content': error_msg})}\n\n"
+                else:
+                    agent_id, content, success = debate_results[i]
+                    chunk_size = 50
+                    for j in range(0, len(content), chunk_size):
+                        chunk = content[j:j+chunk_size]
+                        yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                    if not success:
+                        yield f"data: {json.dumps({'type': 'error', 'message': content})}\n\n"
                 
                 yield f"data: {json.dumps({'type': 'agent_end', 'agent_id': agent.id, 'round': round_num})}\n\n"
             
@@ -522,46 +600,37 @@ async def start_debate(
         raise HTTPException(status_code=400, detail="No agents available")
     
     async def generate():
-        """流式生成辩论内容"""
+        """并行生成辩论内容"""
         for round_num in range(1, debate_data.rounds + 1):
             # 发送轮次开始标记
             yield f"data: {json.dumps({'type': 'round_start', 'round': round_num})}\n\n"
             
+            # 获取所有历史消息（包括之前的轮次）
+            result = await db.execute(
+                select(Message, Agent.name)
+                .outerjoin(Agent, Message.agent_id == Agent.id)
+                .where(Message.discussion_id == discussion_id)
+                .order_by(Message.created_at)
+            )
+            history_messages = result.all()
+            
+            # 滑动窗口：只保留最近15条
+            if len(history_messages) > 15:
+                history_messages = history_messages[-15:]
+            
+            # 为每个Agent构建辩论消息
+            debate_tasks = []
             for agent in agents:
-                # 发送Agent开始标记
-                yield f"data: {json.dumps({'type': 'agent_start', 'agent_id': agent.id, 'agent_name': agent.name, 'agent_role': agent.role, 'round': round_num})}\n\n"
-                
-                # 构建对话历史
-                messages = [
-                    {"role": "system", "content": agent.system_prompt}
-                ]
-                
-                # 获取所有历史消息（包括之前的轮次）
-                result = await db.execute(
-                    select(Message, Agent.name)
-                    .outerjoin(Agent, Message.agent_id == Agent.id)
-                    .where(Message.discussion_id == discussion_id)
-                    .order_by(Message.created_at)
-                )
-                history_messages = result.all()
-                
-                # 滑动窗口：只保留最近15条
-                if len(history_messages) > 15:
-                    history_messages = history_messages[-15:]
-                
-                # 构建对话上下文
+                messages = [{"role": "system", "content": agent.system_prompt}]
                 messages.append({"role": "user", "content": f"讨论主题：{discussion.topic}"})
                 
-                # 添加历史对话
                 for msg, agent_name in history_messages:
                     if msg.message_type == "user":
                         messages.append({"role": "user", "content": msg.content})
                     elif msg.message_type == "agent" and agent_name:
                         if agent_name == agent.name:
-                            # 如果是自己之前的观点，标注
                             messages.append({"role": "assistant", "content": f"【你之前的观点】{msg.content}"})
                         else:
-                            # 其他Agent的观点
                             messages.append({"role": "assistant", "content": f"【{agent_name}的观点】{msg.content}"})
                 
                 # 添加辩论提示
@@ -569,32 +638,30 @@ async def start_debate(
                     debate_prompt = "\n\n请基于其他分析师的观点，进行回应：你可以同意并补充，可以反驳并提出理由，也可以提出新问题。"
                 else:
                     debate_prompt = f"\n\n这是第{round_num}轮辩论，请基于之前的讨论继续深入：回应反驳、补充观点或提出新问题。"
-                
                 messages.append({"role": "user", "content": debate_prompt})
                 
-                # 流式获取AI回复（使用Agent指定的模型，带重试）
-                full_content = ""
-                try:
-                    async for chunk in ai_client.chat_completion_stream(messages, model=agent.model):
-                        full_content += chunk
+                debate_tasks.append(process_agent_response(agent, messages, discussion_id, db))
+            
+            # 并行执行辩论轮次
+            debate_results = await asyncio.gather(*debate_tasks, return_exceptions=True)
+            
+            # 按顺序输出辩论结果
+            for i, agent in enumerate(agents):
+                yield f"data: {json.dumps({'type': 'agent_start', 'agent_id': agent.id, 'agent_name': agent.name, 'agent_role': agent.role, 'round': round_num})}\n\n"
+                
+                if isinstance(debate_results[i], Exception):
+                    error_msg = f"错误: {str(debate_results[i])}"
+                    yield f"data: {json.dumps({'type': 'error', 'message': str(debate_results[i])})}\n\n"
+                    yield f"data: {json.dumps({'type': 'content', 'content': error_msg})}\n\n"
+                else:
+                    agent_id, content, success = debate_results[i]
+                    chunk_size = 50
+                    for j in range(0, len(content), chunk_size):
+                        chunk = content[j:j+chunk_size]
                         yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
-                except Exception as e:
-                    error_msg = f"错误: {str(e)}"
-                    full_content = error_msg
-                    yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+                    if not success:
+                        yield f"data: {json.dumps({'type': 'error', 'message': content})}\n\n"
                 
-                # 保存消息到数据库（即使出错也保存）
-                if full_content.strip():
-                    message = Message(
-                        discussion_id=discussion_id,
-                        agent_id=agent.id,
-                        content=full_content,
-                        message_type="agent"
-                    )
-                    db.add(message)
-                    await db.commit()
-                
-                # 发送Agent结束标记
                 yield f"data: {json.dumps({'type': 'agent_end', 'agent_id': agent.id, 'round': round_num})}\n\n"
             
             # 发送轮次结束标记
@@ -631,22 +698,42 @@ async def enhance_with_data(
     async def generate():
         yield f"data: {json.dumps({'type': 'data_loaded', 'symbols': list(stock_data.keys())})}\n\n"
         
+        # 获取历史消息
+        result = await db.execute(
+            select(Message, Agent.name)
+            .outerjoin(Agent, Message.agent_id == Agent.id)
+            .where(Message.discussion_id == discussion_id)
+            .order_by(Message.created_at)
+        )
+        history_messages = result.all()
+        
+        if len(history_messages) > 15:
+            history_messages = history_messages[-15:]
+        
+        # 构建数据上下文
+        data_context = "\n\n以下是实时股票趋势数据，请基于这些数据验证和调整你的建议：\n\n"
+        for symbol, data in stock_data.items():
+            data_context += f"**{symbol}**:\n"
+            data_context += f"- 当前价格: ${data.get('current_price', 'N/A')}\n"
+            if 'trend_1w' in data:
+                t = data['trend_1w']
+                data_context += f"- 1周趋势: {t['change_percent']:+.2f}% (${t['old_price']:.2f} → ${t['current_price']:.2f})\n"
+            if 'trend_1mo' in data:
+                t = data['trend_1mo']
+                data_context += f"- 1月趋势: {t['change_percent']:+.2f}% (${t['old_price']:.2f} → ${t['current_price']:.2f})\n"
+            if 'trend_3mo' in data:
+                t = data['trend_3mo']
+                data_context += f"- 3月趋势: {t['change_percent']:+.2f}% (${t['old_price']:.2f} → ${t['current_price']:.2f})\n"
+            if data.get('rsi'):
+                data_context += f"- RSI: {data['rsi']:.2f}\n"
+            data_context += "\n"
+        
+        data_context += "\n请基于以上实时趋势数据，验证和调整你之前的建议。关注趋势（1周/1月/3月），不只是当天价格。"
+        
+        # 为每个Agent构建消息
+        enhance_tasks = []
         for agent in agents:
-            yield f"data: {json.dumps({'type': 'agent_start', 'agent_id': agent.id, 'agent_name': agent.name, 'agent_role': agent.role})}\n\n"
-            
             messages = [{"role": "system", "content": agent.system_prompt}]
-            
-            result = await db.execute(
-                select(Message, Agent.name)
-                .outerjoin(Agent, Message.agent_id == Agent.id)
-                .where(Message.discussion_id == discussion_id)
-                .order_by(Message.created_at)
-            )
-            history_messages = result.all()
-            
-            if len(history_messages) > 15:
-                history_messages = history_messages[-15:]
-            
             messages.append({"role": "user", "content": f"讨论主题：{discussion.topic}"})
             
             for msg, agent_name in history_messages:
@@ -655,45 +742,28 @@ async def enhance_with_data(
                 elif msg.message_type == "agent" and agent_name:
                     messages.append({"role": "assistant", "content": f"【{agent_name}的观点】{msg.content}"})
             
-            data_context = "\n\n以下是实时股票趋势数据，请基于这些数据验证和调整你的建议：\n\n"
-            for symbol, data in stock_data.items():
-                data_context += f"**{symbol}**:\n"
-                data_context += f"- 当前价格: ${data.get('current_price', 'N/A')}\n"
-                if 'trend_1w' in data:
-                    t = data['trend_1w']
-                    data_context += f"- 1周趋势: {t['change_percent']:+.2f}% (${t['old_price']:.2f} → ${t['current_price']:.2f})\n"
-                if 'trend_1mo' in data:
-                    t = data['trend_1mo']
-                    data_context += f"- 1月趋势: {t['change_percent']:+.2f}% (${t['old_price']:.2f} → ${t['current_price']:.2f})\n"
-                if 'trend_3mo' in data:
-                    t = data['trend_3mo']
-                    data_context += f"- 3月趋势: {t['change_percent']:+.2f}% (${t['old_price']:.2f} → ${t['current_price']:.2f})\n"
-                if data.get('rsi'):
-                    data_context += f"- RSI: {data['rsi']:.2f}\n"
-                data_context += "\n"
-            
-            data_context += "\n请基于以上实时趋势数据，验证和调整你之前的建议。关注趋势（1周/1月/3月），不只是当天价格。"
             messages.append({"role": "user", "content": data_context})
+            enhance_tasks.append(process_agent_response(agent, messages, discussion_id, db))
+        
+        # 并行执行数据增强
+        enhance_results = await asyncio.gather(*enhance_tasks, return_exceptions=True)
+        
+        # 按顺序输出结果
+        for i, agent in enumerate(agents):
+            yield f"data: {json.dumps({'type': 'agent_start', 'agent_id': agent.id, 'agent_name': agent.name, 'agent_role': agent.role})}\n\n"
             
-            full_content = ""
-            try:
-                async for chunk in ai_client.chat_completion_stream(messages, model=agent.model):
-                    full_content += chunk
+            if isinstance(enhance_results[i], Exception):
+                error_msg = f"错误: {str(enhance_results[i])}"
+                yield f"data: {json.dumps({'type': 'error', 'message': str(enhance_results[i])})}\n\n"
+                yield f"data: {json.dumps({'type': 'content', 'content': error_msg})}\n\n"
+            else:
+                agent_id, content, success = enhance_results[i]
+                chunk_size = 50
+                for j in range(0, len(content), chunk_size):
+                    chunk = content[j:j+chunk_size]
                     yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
-            except Exception as e:
-                error_msg = f"错误: {str(e)}"
-                full_content = error_msg
-                yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
-            
-            if full_content.strip():
-                message = Message(
-                    discussion_id=discussion_id,
-                    agent_id=agent.id,
-                    content=full_content,
-                    message_type="agent"
-                )
-                db.add(message)
-                await db.commit()
+                if not success:
+                    yield f"data: {json.dumps({'type': 'error', 'message': content})}\n\n"
             
             yield f"data: {json.dumps({'type': 'agent_end', 'agent_id': agent.id})}\n\n"
         
