@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Opinion Room - AI多智能体讨论平台</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- 左侧：Agent管理面板 -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <h1 class="logo">💹 Opinion Room</h1>
+                <p class="subtitle">AI多智能体讨论平台</p>
+            </div>
+
+            <div class="agents-section">
+                <div class="section-header">
+                    <h2>分析师团队</h2>
+                    <div class="header-actions">
+                        <button class="btn-icon-small" onclick="loadDefaultTeam()" title="加载默认团队">📋</button>
+                        <button class="btn-icon" id="addAgentBtn" title="添加Agent">
+                            <span>+</span>
+                        </button>
+                    </div>
+                </div>
+                <div id="agentsList" class="agents-list">
+                    <!-- Agent列表动态加载 -->
+                </div>
+            </div>
+
+            <div class="discussions-section">
+                <div class="section-header">
+                    <h2>历史讨论</h2>
+                </div>
+                <div id="discussionsList" class="discussions-list">
+                    <!-- 讨论历史动态加载 -->
+                </div>
+            </div>
+        </aside>
+
+        <!-- 右侧：讨论区 -->
+        <main class="main-content">
+            <!-- 顶部栏 -->
+            <div class="top-bar">
+                <div class="discussion-info">
+                    <h2 id="currentTopic">开始新的讨论</h2>
+                </div>
+                <div class="actions">
+                    <button class="btn-danger" id="stopBtn" style="display: none;">⏸ 停止</button>
+                    <button class="btn-primary" id="resumeBtn" style="display: none;">▶ 继续</button>
+                    <button class="btn-secondary" id="newDiscussionBtn">新讨论</button>
+                    <button class="btn-secondary" id="summarizeBtn" style="display: none;">生成总结</button>
+                </div>
+            </div>
+
+            <!-- 消息区域 -->
+            <div class="messages-container" id="messagesContainer">
+                <div class="welcome-screen" id="welcomeScreen">
+                    <div class="welcome-content">
+                        <h1>欢迎使用 Opinion Room</h1>
+                        <p>多智能体AI讨论平台</p>
+                        <div class="welcome-steps">
+                            <div class="step">
+                                <div class="step-number">1</div>
+                                <p>添加AI分析师并定义他们的角色</p>
+                            </div>
+                            <div class="step">
+                                <div class="step-number">2</div>
+                                <p>输入投资话题开始讨论</p>
+                            </div>
+                            <div class="step">
+                                <div class="step-number">3</div>
+                                <p>观看AI分析师们的精彩讨论</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 输入区域 -->
+            <div class="input-area">
+                <div class="input-container">
+                    <textarea 
+                        id="messageInput" 
+                        placeholder="输入话题开始讨论，或 @Agent名称 单独提问..." 
+                        rows="3"
+                    ></textarea>
+                    <div id="agentAutocomplete" class="agent-autocomplete" style="display: none;"></div>
+                    <button class="btn-primary" id="sendBtn">
+                        <span id="sendBtnText">开始讨论</span>
+                    </button>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Agent编辑模态框 -->
+    <div class="modal" id="agentModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="modalTitle">添加分析师</h2>
+                <button class="btn-close" id="closeModalBtn">&times;</button>
+            </div>
+            <form id="agentForm">
+                <div class="form-group">
+                    <label for="agentName">名称</label>
+                    <input type="text" id="agentName" required placeholder="例如：价值投资者">
+                </div>
+                <div class="form-group">
+                    <label for="agentRole">角色描述</label>
+                    <input type="text" id="agentRole" required placeholder="例如：专注于长期价值投资">
+                </div>
+                <div class="form-group">
+                    <label for="agentPrompt">系统提示词</label>
+                    <textarea 
+                        id="agentPrompt" 
+                        rows="8" 
+                        required 
+                        placeholder="定义这个分析师的专业背景、分析视角和风格...&#10;&#10;例如：你是一位经验丰富的价值投资分析师，擅长从基本面角度分析投资机会。你注重企业的内在价值，关注财务指标、护城河和管理层能力。请用专业但易懂的语言提供你的分析观点。"
+                    ></textarea>
+                </div>
+                <div class="form-group">
+                    <label for="agentModel">AI模型</label>
+                    <select id="agentModel" required>
+                        <option value="">加载中...</option>
+                    </select>
+                </div>
+                <div class="form-actions">
+                    <button type="button" class="btn-secondary" id="cancelBtn">取消</button>
+                    <button type="submit" class="btn-primary">保存</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/marked@11.1.1/marked.min.js"></script>
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
+
